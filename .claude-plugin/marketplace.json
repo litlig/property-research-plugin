@@ -1,6 +1,9 @@
 {
   "name": "property-research",
-  "owner": { "name": "xiaofeihu" },
+  "owner": {
+    "name": "xiaofeihu"
+  },
+  "description": "Claude Code plugin for address-level US real estate research from free public data.",
   "plugins": [
     {
       "name": "property-research",

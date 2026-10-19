@@ -14,15 +14,17 @@ A Claude Code plugin that researches a US residential property from its address:
 ## Install
 
 ```
-/plugin marketplace add <owner>/property-research-plugin
+/plugin marketplace add litlig/property-research-plugin
 /plugin install property-research@property-research
 ```
 
-Then ask Claude, e.g. "research 123 Main St, Springfield, IL 62701" or run `/property-research <address>`.
+Then ask Claude, e.g. "research 123 Main St, Springfield, IL 62701", or run
+`/property-research:property-research <address>`.
 
-Requires [uv](https://docs.astral.sh/uv/). The first run downloads about 1 GB of public datasets
-into `~/.cache/property-research` (override with `PROPERTY_RESEARCH_CACHE`); later runs take
-seconds.
+Requires [uv](https://docs.astral.sh/uv/). The first run downloads about 1 GB of public CSVs
+and converts them to Parquet in `~/.cache/property-research` (override with
+`PROPERTY_RESEARCH_CACHE`); the cache settles around 150 MB. Later runs take seconds and check for
+new data once a day.
 
 ## Data sources
 
@@ -33,10 +35,14 @@ seconds.
 | Listing inventory | [Realtor.com Research](https://www.realtor.com/research/data/) inventory by ZIP |
 | Sold homes, active listings | Redfin's public "Download All" CSV endpoint |
 
-Redfin's CSV endpoint is undocumented and unofficial; it may change or block requests, and its
-use is subject to Redfin's terms. The script rate-limits and caches requests. Zillow and
-Realtor.com data are used under their research-data terms; attribute them when you republish
-results.
+**Redfin's CSV endpoint is undocumented and unofficial.** It may change or block requests at any
+time, and automated use may conflict with Redfin's terms of use; review them and decide for
+yourself. The script identifies itself with its own User-Agent, spaces requests 1.5 s apart,
+caches responses for 12 h and makes at most 20 requests per report (about 6–10 normally). Pass
+`--no-redfin` to use only Zillow and Realtor.com data (no subject record, comps or listings).
+
+Zillow and Realtor.com research data are free to use with attribution; each report ends with a
+sources line. Keep it when you share results.
 
 Output is an automated estimate, not an appraisal.
 

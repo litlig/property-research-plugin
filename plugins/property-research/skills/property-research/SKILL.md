@@ -10,18 +10,24 @@ write a clear answer.
 
 ## 1. Run the report
 
-Requires [uv](https://docs.astral.sh/uv/). The script declares its own dependencies, so `uv run`
-installs them on first use. Substitute the base directory shown when this skill loads.
+Requires [uv](https://docs.astral.sh/uv/) (`curl -LsSf https://astral.sh/uv/install.sh | sh`). The
+script declares its own dependencies, so `uv run` installs them on first use.
 
 ```bash
-uv run "<this skill's base directory>/scripts/property_research.py" report "<full address with city, state, ZIP>" --out ./property-reports
+uv run "${CLAUDE_SKILL_DIR}/scripts/property_research.py" report "<full address with city, state, ZIP>" --out ./property-reports
 ```
+
+If `${CLAUDE_SKILL_DIR}` isn't expanded in your version, use the base directory shown when this
+skill loaded. Output goes to `./property-reports` under the current directory; if that's a code
+repo the user may not want it there, so pick another `--out` (e.g. `~/property-reports`) when in doubt.
 
 Useful flags: `--type sfr|condo|townhouse|multi`, `--beds 3 --baths 2 --sqft 1850 --year-built 1962`
 (override or fill the subject's specs), `--months 6` (comp window), `--radius 0.5` (starting comp
 radius in miles; it auto-shrinks at the 350-row cap and auto-widens to 2 mi when fewer than 5 comps
-match), `--trend-radius 0.5`, `--years 5`, `--sqft-pct 0.25`, `--beds-diff 1`, `--zip`.
-Include the unit (`#4`, `Unit B`) for condos.
+match), `--trend-radius 0.5`, `--years 5` (1–20; local sales cap at 5), `--sqft-pct 0.25`,
+`--beds-diff 1`, `--max-comps 10`, `--zip` (changes only the ZIP used for market data, not where
+Redfin searches), `--no-redfin` (market trend only).
+Include the unit for condos, preferably as `#4`, and confirm the matched unit in the report.
 
 The first run downloads ~1 GB of Zillow and Realtor.com files into `~/.cache/property-research`
 (about 1 minute on a fast connection; run it in the background if needed). Later runs take
@@ -35,9 +41,10 @@ lists **same-model sales** (same beds, sqft ±5%, built ±5 yrs) when the subjec
 
 Read the **Data notes** section first.
 
-- **Subject specs.** If the record is missing, matched another unit, or has no beds/sqft, ask the
-  user for beds/baths/sqft/type (or the unit number) and rerun. Don't present a value estimate
-  without size-matched comps; the script skips it in that case.
+- **Subject specs.** If the subject wasn't matched (the note lists the units Redfin does have),
+  isn't residential, or has no beds/sqft, ask the user for beds/baths/sqft/type (or the unit
+  number) and rerun. The script skips the value estimate when it has no confirmed specs; if only
+  beds are known it still estimates without size adjustment, so treat that as rough.
 - **Comps.** Scan the table for things the score can't see: a different neighborhood or school
   boundary (a different ZIP across a freeway or river), new construction vs. original condition,
   multi-unit buildings labeled as houses, extreme $/sqft outliers. If the set is poor, rerun with
@@ -89,16 +96,23 @@ If the user wants something visual or shareable, build an HTML artifact. Chart t
 | Value trend | Zillow Research ZHVI by ZIP (all homes + SFR or condo) | monthly, ~mid-month |
 | Supply/demand | Realtor.com Research inventory by ZIP | monthly, ~1st of month |
 | Subject record, comps, local sales, active listings | Redfin `stingray/api/gis-csv` (the "Download All" endpoint; MLS + public record) | days |
-| Sale-to-list, homes sold | Redfin Data Center ZIP tracker, only if `REDFIN_TRACKER_PARQUET` points to a local Parquet extract of Redfin's ZIP tracker | **stale**: Redfin's public file hasn't updated since 2026-06-02 |
+
+Advanced: if `REDFIN_TRACKER_PARQUET` points to a local Parquet extract of Redfin Data Center's ZIP
+market tracker, the report adds sale-to-list and homes-sold stats. That file updates irregularly;
+the report shows its period end date.
 
 ## If Redfin blocks the endpoint
 
-The script reports `Redfin blocked the request`. Fallbacks, in order:
-1. **Claude in Chrome** (if available). Open a redfin.com Sold search around the address
-   (last 6 months), click "Download All", and feed the CSV into analysis. Its columns match what
-   the script parses.
-2. **RentCast API** (`RENTCAST_API_KEY`, 50 free calls/month): `GET /v1/properties` with
-   `latitude`, `longitude`, `radius` and `saleDateRange`. Records carry only the last sale.
+The report's notes say `Redfin unavailable (...)`. Don't retry in a loop. Fallbacks, in order:
+1. **Ask the user** to export a Sold search from redfin.com themselves ("Download All" under the
+   map), then analyze that CSV with pandas. It has the same columns the script parses.
+2. **RentCast API** (`RENTCAST_API_KEY`, 50 free calls/month):
+   `GET https://api.rentcast.io/v1/properties` with header `X-Api-Key: <key>` and params
+   `latitude`, `longitude`, `radius` (miles) and `saleDateRange` (days). Records carry only the
+   last sale.
 3. County assessor/recorder open-data portals for sale records.
+
+Redfin's CSV endpoint is unofficial. The script identifies itself, spaces requests 1.5 s apart,
+caches them for 12 h and stops after 20 per run. Keep it that way: don't script extra Redfin calls.
 
 The Zillow and Realtor.com trend sections still work without Redfin.

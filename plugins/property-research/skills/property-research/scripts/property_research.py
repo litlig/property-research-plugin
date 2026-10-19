@@ -38,9 +38,11 @@ import pandas as pd
 import requests
 
 CACHE = Path(os.environ.get("PROPERTY_RESEARCH_CACHE", Path.home() / ".cache" / "property-research"))
-UA = ("Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 "
-      "(KHTML, like Gecko) Chrome/130.0 Safari/537.36")
+PROJECT_URL = "https://github.com/litlig/property-research-plugin"
+UA = f"property-research-claude-plugin/0.1 (+{PROJECT_URL})"  # identify ourselves honestly
 TODAY = pd.Timestamp.today().normalize()
+MAX_YEARS_SALES = 5   # Redfin's longest sold window is 1825 days
+MAX_REDFIN_CALLS = 20  # per run, a backstop against loops hammering the endpoint
 
 ZILLOW_URL = "https://files.zillowstatic.com/research/public_csvs/zhvi/Zip_zhvi_uc_{t}_tier_0.33_0.67_sm_sa_month.csv"
 REALTOR_URL = "https://econdata.s3-us-west-2.amazonaws.com/Reports/Core/RDC_Inventory_Core_Metrics_Zip_History.csv"
@@ -84,17 +86,25 @@ def geocode(address: str) -> dict:
                     "lon": m[0]["coordinates"]["x"], "zip": c.get("zip"),
                     "city": (c.get("city") or "").title(), "state": c.get("state"),
                     "source": "US Census geocoder"}
-    except requests.RequestException as e:
+    except (requests.RequestException, ValueError, KeyError) as e:
         log(f"Census geocoder failed: {e}")
-    r = requests.get("https://nominatim.openstreetmap.org/search",
-                     params={"q": address, "format": "json", "addressdetails": 1,
-                             "countrycodes": "us", "limit": 1},
-                     headers={"User-Agent": "property-research-skill/1.0"}, timeout=20)
-    r.raise_for_status()
-    if not r.json():
-        sys.exit(f"Could not geocode: {address}")
-    h = r.json()[0]
+    try:
+        r = requests.get("https://nominatim.openstreetmap.org/search",
+                         params={"q": address, "format": "json", "addressdetails": 1,
+                                 "countrycodes": "us", "limit": 1},
+                         headers={"User-Agent": UA}, timeout=20)
+        r.raise_for_status()
+        hits = r.json()
+    except (requests.RequestException, ValueError) as e:
+        sys.exit(f"Could not geocode {address!r}: {e}")
+    if not hits:
+        sys.exit(f"Could not geocode {address!r}. Check the street, city, state and ZIP.")
+    h = hits[0]
     a = h.get("address", {})
+    # Without a house number the hit is a street, city or ZIP centroid: comps around it would be wrong.
+    if "house_number" not in a:
+        sys.exit(f"Could only locate {address!r} approximately ({h.get('display_name')}). "
+                 "Check the house number and street, or include the ZIP.")
     return {"matched": h["display_name"], "lat": float(h["lat"]), "lon": float(h["lon"]),
             "zip": (a.get("postcode") or "")[:5], "city": a.get("city") or a.get("town"),
             "state": a.get("ISO3166-2-lvl4", "US-")[-2:], "source": "OpenStreetMap Nominatim"}
@@ -102,50 +112,76 @@ def geocode(address: str) -> dict:
 
 # ------------------------------------------------------------------ dataset cache
 
+def _sql_path(p: Path) -> str:
+    """Quote a filesystem path as a SQL string literal."""
+    return "'" + str(p).replace("'", "''") + "'"
+
+
 def _meta() -> dict:
     p = CACHE / "meta.json"
-    return json.loads(p.read_text()) if p.exists() else {}
+    try:
+        return json.loads(p.read_text(encoding="utf-8")) if p.exists() else {}
+    except ValueError:
+        return {}
 
 
-def _save_meta(meta: dict) -> None:
+def _save_meta(url: str, m: dict) -> None:
+    # Re-read just before writing so a concurrent run's entries for other URLs survive.
     CACHE.mkdir(parents=True, exist_ok=True)
-    (CACHE / "meta.json").write_text(json.dumps(meta, indent=1))
+    meta = _meta()
+    meta[url] = m
+    tmp = CACHE / f"meta.json.{os.getpid()}"
+    tmp.write_text(json.dumps(meta, indent=1), encoding="utf-8")
+    os.replace(tmp, CACHE / "meta.json")
 
 
 def ensure_dataset(url: str, parquet: Path, build, force: bool = False) -> dict:
-    """Download `url` and convert it with `build(raw, parquet)` when the remote copy is newer.
+    """Download `url` and convert it with `build(raw, parquet)` when the remote copy changed.
 
-    The remote Last-Modified header is checked at most once a day.
+    The remote version (Last-Modified, else ETag/Content-Length) is checked at most once a day; with
+    no version header at all the file is re-downloaded weekly. If the check fails, the cache is used.
     """
-    meta = _meta()
-    m = meta.get(url, {})
+    m = _meta().get(url, {})
     now = time.time()
     if parquet.exists() and not force and now - m.get("checked", 0) < 86400:
         return m
-    remote = requests.head(url, timeout=30).headers.get("Last-Modified")
+    try:
+        h = requests.head(url, timeout=30, allow_redirects=True)
+        h.raise_for_status()
+        remote = (h.headers.get("Last-Modified") or h.headers.get("ETag")
+                  or h.headers.get("Content-Length"))
+    except requests.RequestException as e:
+        if parquet.exists():
+            log(f"Could not check {url} for updates ({e}); using cached copy.")
+            return m
+        raise
     m["checked"] = now
-    if parquet.exists() and not force and remote == m.get("last_modified"):
-        meta[url] = m
-        _save_meta(meta)
+    stale_unversioned = remote is None and now - m.get("downloaded", 0) > 7 * 86400
+    if parquet.exists() and not force and not stale_unversioned and remote == m.get("last_modified"):
+        _save_meta(url, m)
         return m
-    raw = parquet.with_suffix(".download")
+    raw = CACHE / f"{parquet.stem}.{os.getpid()}.download"
+    built = CACHE / f"{parquet.stem}.{os.getpid()}.parquet.tmp"
     log(f"Downloading {url} ...")
-    with requests.get(url, stream=True, timeout=60) as r, open(raw, "wb") as f:
-        r.raise_for_status()
-        for chunk in r.iter_content(1 << 20):
-            f.write(chunk)
-    build(raw, parquet)
-    raw.unlink()
-    m["last_modified"] = remote
-    meta[url] = m
-    _save_meta(meta)
+    try:
+        with requests.get(url, stream=True, timeout=60) as r, open(raw, "wb") as f:
+            r.raise_for_status()
+            for chunk in r.iter_content(1 << 20):
+                f.write(chunk)
+        build(raw, built)
+        os.replace(built, parquet)  # atomic: readers never see a half-written file
+    finally:
+        raw.unlink(missing_ok=True)
+        built.unlink(missing_ok=True)
+    m.update(last_modified=remote, downloaded=now)
+    _save_meta(url, m)
     return m
 
 
 def _build_zillow(raw: Path, parquet: Path) -> None:
     duckdb.execute(
-        f"COPY (SELECT * FROM read_csv('{raw}', header=true, types={{'RegionName': 'VARCHAR'}})) "
-        f"TO '{parquet}' (FORMAT parquet)"
+        f"COPY (SELECT * FROM read_csv({_sql_path(raw)}, header=true, types={{'RegionName': 'VARCHAR'}})) "
+        f"TO {_sql_path(parquet)} (FORMAT parquet)"
     )
 
 
@@ -162,10 +198,10 @@ def _build_realtor(raw: Path, parquet: Path) -> None:
         f"""COPY (
             SELECT TRY_CAST(month_date_yyyymm AS INTEGER) AS month,
                    lpad(CAST(postal_code AS VARCHAR), 5, '0') AS zip, zip_name, {casts}
-            FROM read_csv('{raw}', header=true, all_varchar=true, ignore_errors=true)
+            FROM read_csv({_sql_path(raw)}, header=true, all_varchar=true, ignore_errors=true)
             WHERE TRY_CAST(month_date_yyyymm AS INTEGER) IS NOT NULL
             ORDER BY zip, month
-        ) TO '{parquet}' (FORMAT parquet, COMPRESSION zstd)"""
+        ) TO {_sql_path(parquet)} (FORMAT parquet, COMPRESSION zstd)"""
     )
 
 
@@ -175,7 +211,7 @@ def zillow_series(zip_code: str, series: str, force: bool = False) -> tuple[pd.S
     CACHE.mkdir(parents=True, exist_ok=True)
     m = ensure_dataset(url, pq, _build_zillow, force)
     row = duckdb.execute(
-        f"SELECT * FROM read_parquet('{pq}') WHERE lpad(RegionName, 5, '0') = ?", [zip_code]
+        f"SELECT * FROM read_parquet({_sql_path(pq)}) WHERE lpad(RegionName, 5, '0') = ?", [zip_code]
     ).df()
     if row.empty:
         return pd.Series(dtype=float), m
@@ -189,7 +225,7 @@ def realtor_frame(zip_code: str, force: bool = False) -> tuple[pd.DataFrame, dic
     pq = CACHE / "realtor_zip_history.parquet"
     CACHE.mkdir(parents=True, exist_ok=True)
     m = ensure_dataset(REALTOR_URL, pq, _build_realtor, force)
-    df = duckdb.execute(f"SELECT * FROM read_parquet('{pq}') WHERE zip = ? ORDER BY month",
+    df = duckdb.execute(f"SELECT * FROM read_parquet({_sql_path(pq)}) WHERE zip = ? ORDER BY month",
                         [zip_code]).df()
     df["date"] = pd.to_datetime(df["month"].astype(str), format="%Y%m") + pd.offsets.MonthEnd(0)
     return df, m
@@ -199,18 +235,20 @@ def redfin_tracker(zip_code: str, ptype: str) -> pd.DataFrame:
     if not REDFIN_TRACKER_PARQUET or not Path(REDFIN_TRACKER_PARQUET).expanduser().exists():
         return pd.DataFrame()
     return duckdb.execute(
-        f"SELECT * FROM read_parquet('{Path(REDFIN_TRACKER_PARQUET).expanduser()}') WHERE REGION = ? AND PROPERTY_TYPE = ? "
-        "ORDER BY PERIOD_END", [f"Zip Code: {zip_code}", ptype]
+        f"SELECT * FROM read_parquet({_sql_path(Path(REDFIN_TRACKER_PARQUET).expanduser())}) "
+        "WHERE REGION = ? AND PROPERTY_TYPE = ? ORDER BY PERIOD_END", [f"Zip Code: {zip_code}", ptype]
     ).df()
 
 
 # ------------------------------------------------------------------ Redfin sold/active CSV
 
 class RedfinBlocked(RuntimeError):
-    pass
+    """Redfin refused, failed, or is disabled; the report continues without its sections."""
 
 
 _last_call = 0.0
+_calls = 0
+REDFIN_ENABLED = True
 
 
 def circle_poly(lat: float, lon: float, miles: float, n: int = 24) -> str:
@@ -225,7 +263,9 @@ def circle_poly(lat: float, lon: float, miles: float, n: int = 24) -> str:
 def redfin_csv(lat: float, lon: float, miles: float, *, sold_days: int | None,
                uipt: str = "1,2,3,4", ttl_hours: float = 12) -> pd.DataFrame:
     """Homes in a circle. sold_days=None -> active listings; otherwise sold within N days."""
-    global _last_call
+    global _last_call, _calls
+    if not REDFIN_ENABLED:
+        raise RedfinBlocked("disabled with --no-redfin")
     params = {"al": 1, "num_homes": REDFIN_MAX_ROWS, "uipt": uipt, "v": 8,
               "poly": circle_poly(lat, lon, miles)}
     if sold_days is None:
@@ -235,29 +275,37 @@ def redfin_csv(lat: float, lon: float, miles: float, *, sold_days: int | None,
     url = f"{REDFIN_GIS}?{urllib.parse.urlencode(params)}"
     cache = CACHE / "redfin" / (hashlib.md5(url.encode()).hexdigest() + ".csv")
     if cache.exists() and time.time() - cache.stat().st_mtime < ttl_hours * 3600:
-        text = cache.read_text()
+        text = cache.read_text(encoding="utf-8")
     else:
+        if _calls >= MAX_REDFIN_CALLS:
+            raise RedfinBlocked(f"per-run limit of {MAX_REDFIN_CALLS} Redfin requests reached")
         time.sleep(max(0.0, 1.5 - (time.time() - _last_call)))
-        r = requests.get(url, headers={"User-Agent": UA, "Accept": "text/csv,*/*"}, timeout=30)
-        _last_call = time.time()
+        _calls += 1
+        try:
+            r = requests.get(url, headers={"User-Agent": UA, "Accept": "text/csv,*/*"}, timeout=30,
+                             allow_redirects=False)
+        except requests.RequestException as e:
+            raise RedfinBlocked(f"request failed: {e}") from e
+        finally:
+            _last_call = time.time()
         if r.status_code != 200 or not r.text.startswith("SALE TYPE"):
             raise RedfinBlocked(f"Redfin returned HTTP {r.status_code} ({r.text[:120]!r})")
         text = r.text
         cache.parent.mkdir(parents=True, exist_ok=True)
-        cache.write_text(text)
+        cache.write_text(text, encoding="utf-8")
     return _parse_redfin(text)
 
 
 def _parse_redfin(text: str) -> pd.DataFrame:
     from io import StringIO
-    raw = pd.read_csv(StringIO(text))
+    raw = pd.read_csv(StringIO(text), dtype={"ZIP OR POSTAL CODE": str})
     raw = raw[raw["SALE TYPE"].isin(["PAST SALE", "MLS Listing", "New Construction Home"])]
     url_col = next(c for c in raw.columns if c.startswith("URL"))
     df = pd.DataFrame({
         "status": raw["STATUS"], "sale_type": raw["SALE TYPE"],
         "sold_date": pd.to_datetime(raw["SOLD DATE"], format="%B-%d-%Y", errors="coerce"),
         "property_type": raw["PROPERTY TYPE"], "address": raw["ADDRESS"], "city": raw["CITY"],
-        "zip": raw["ZIP OR POSTAL CODE"].astype(str).str[:5],
+        "zip": raw["ZIP OR POSTAL CODE"].str.strip().str[:5].str.zfill(5),
         "price": pd.to_numeric(raw["PRICE"], errors="coerce"),
         "beds": pd.to_numeric(raw["BEDS"], errors="coerce"),
         "baths": pd.to_numeric(raw["BATHS"], errors="coerce"),
@@ -298,6 +346,7 @@ class Subject:
     last_sale_date: str | None = None
     url: str | None = None
     record_source: str = "none"
+    verified: bool = False             # specs came from a matching residential record or from flags
 
 
 def _tokens(s: str) -> list[str]:
@@ -305,42 +354,75 @@ def _tokens(s: str) -> list[str]:
 
 
 def _unit(s: str) -> str | None:
-    m = re.search(r"(?:#|\bapt\b|\bunit\b|\bste\b)\s*([a-z0-9-]+)", s.lower())
+    m = re.search(r"(?:#|\b(?:apt|apartment|unit|ste|suite)\b\.?)\s*#?\s*([a-z0-9-]+)", s.lower())
     return m.group(1) if m else None
+
+
+def _street_line(address: str) -> str:
+    return address.split(",")[0]
+
+
+def same_property(a: str, b: str) -> bool:
+    """Same street line ignoring case, punctuation and the unit marker ('Apt 3' == '#3')."""
+    def key(s):
+        s = _street_line(s).lower()
+        u = _unit(s)
+        s = re.sub(r"(?:#|\b(?:apt|apartment|unit|ste|suite)\b\.?)\s*#?\s*[a-z0-9-]+", " ", s)
+        t = [SUFFIX_ABBR.get(x, x) for x in _tokens(s)]
+        return t, u
+    return key(a) == key(b)
 
 
 STREET_WORDS = {"st", "street", "ave", "avenue", "rd", "road", "dr", "drive", "blvd", "ln", "lane",
                 "ct", "court", "pl", "place", "way", "ter", "terrace", "cir", "circle", "pkwy", "hwy",
                 "n", "s", "e", "w", "ne", "nw", "se", "sw", "north", "south", "east", "west"}
+SUFFIX_ABBR = {"street": "st", "avenue": "ave", "road": "rd", "drive": "dr", "boulevard": "blvd",
+               "lane": "ln", "court": "ct", "place": "pl", "terrace": "ter", "circle": "cir",
+               "parkway": "pkwy", "highway": "hwy", "north": "n", "south": "s", "east": "e", "west": "w"}
 
 
-def find_subject_record(address: str, lat: float, lon: float) -> pd.Series | None:
-    """Match the subject in a small Redfin search around its coordinates (public record + MLS)."""
-    toks = _tokens(address.split(",")[0])
+def find_subject_record(address: str, lat: float, lon: float) -> tuple[pd.Series | None, str | None]:
+    """Match the subject in a small Redfin search around its coordinates (public record + MLS).
+
+    Returns (record, problem). The record is None when nothing matches the house number, street
+    name and unit; `problem` then says what was found instead (e.g. other units in the building).
+    """
+    line = _street_line(address)
+    unit = _unit(line)
+    toks = _tokens(re.sub(r"(?:#|\b(?:apt|apartment|unit|ste|suite)\b\.?)\s*#?\s*[a-z0-9-]+", " ", line.lower()))
     if not toks or not toks[0].isdigit():
-        return None
+        return None, "address has no house number"
     number = toks[0]
-    unit = _unit(address)
-    street = [t for t in toks[1:] if t not in STREET_WORDS and t != unit][:1]
+    # The street name is the first non-suffix word; names made only of such words ("Court St")
+    # fall back to the first word after the number.
+    street = next((t for t in toks[1:] if t not in STREET_WORDS), toks[1] if len(toks) > 1 else None)
 
-    def match(a: str) -> float:
+    def match(a: str) -> int:
         t = _tokens(str(a))
-        if not t or t[0] != number or (street and street[0] not in t[1:5]):
+        if not t or t[0] != number or (street and street not in t[1:5]):
             return -1
         u = _unit(str(a))
         return 2 if u == unit else (1 if unit is None and u is None else 0)
 
     # Census geocodes are interpolated along the block, so widen once if needed.
+    others: list[str] = []
     for miles in (0.05, 0.12):
         df = redfin_csv(lat, lon, miles, sold_days=36500, uipt="1,2,3,4,5,6,7,8")
         if df.empty:
             continue
         df["m"] = df["address"].map(match)
-        df = df[df["m"] >= 0]
-        if len(df):
-            df["filled"] = df[["beds", "baths", "sqft", "year_built"]].notna().sum(axis=1)
-            return df.sort_values(["m", "filled", "sold_date"], ascending=False).iloc[0]
-    return None
+        exact = df[df["m"] >= 1]
+        others = sorted(set(df.loc[df["m"] == 0, "address"]))
+        if len(exact):
+            exact = exact.assign(filled=exact[["beds", "baths", "sqft", "year_built"]].notna().sum(axis=1))
+            return exact.sort_values(["m", "filled", "sold_date"], ascending=False).iloc[0], None
+        if others:
+            break
+    if others:
+        shown = ", ".join(others[:8]) + (" …" if len(others) > 8 else "")
+        want = f"unit {unit!r}" if unit else "a building-level record"
+        return None, f"Redfin has no record for {want} at this address; it lists: {shown}"
+    return None, None
 
 
 # ------------------------------------------------------------------ market analysis
@@ -427,7 +509,9 @@ def redfin_tracker_summary(df: pd.DataFrame) -> dict:
 def local_sales_history(subj: Subject, miles: float, uipt: str, years: int) -> tuple[pd.DataFrame, list[str]]:
     """Union of nested sold windows so the 350-row cap bites as late as possible."""
     notes, frames = [], []
-    windows = sorted({365, 1095, 1825 if years >= 5 else 1095 if years >= 3 else 365})
+    years = min(years, MAX_YEARS_SALES)
+    need = years * 365
+    windows = [w for w in (365, 1095, 1825) if w < need] + [next(w for w in (365, 1095, 1825) if w >= need)]
     for w in windows:
         d = redfin_csv(subj.lat, subj.lon, miles, sold_days=w, uipt=uipt)
         if len(d) >= REDFIN_MAX_ROWS:
@@ -436,8 +520,16 @@ def local_sales_history(subj: Subject, miles: float, uipt: str, years: int) -> t
         frames.append(d)
     df = pd.concat(frames).dropna(subset=["sold_date", "price"])
     df = df.drop_duplicates(subset=["url", "sold_date"])
-    df = df[df["price"] > 10_000]
+    df = df[(df["price"] > 10_000) & (df["sold_date"] > TODAY - pd.DateOffset(years=years))]
     return df.sort_values("sold_date").reset_index(drop=True), notes
+
+
+def is_subject(subj: Subject, df: pd.DataFrame) -> pd.Series:
+    """Rows that are the subject itself (by Redfin URL, else by normalized street line)."""
+    hit = df["address"].fillna("").map(lambda a: same_property(a, subj.address)).astype(bool)
+    if subj.url:
+        hit |= df["url"].eq(subj.url)
+    return hit
 
 
 def quarterly(df: pd.DataFrame) -> list[dict]:
@@ -459,14 +551,14 @@ def same_model_sales(subj: Subject, sales: pd.DataFrame, zhvi: pd.Series) -> lis
     d = sales[(sales["beds"] == subj.beds) & sales["sqft"].between(subj.sqft * 0.95, subj.sqft * 1.05)]
     if subj.year_built:
         d = d[d["year_built"].isna() | ((d["year_built"] - subj.year_built).abs() <= 5)]
-    d = d[~d["address"].fillna("").str.lower().eq(subj.address.split(",")[0].lower().strip())]
+    d = d[~is_subject(subj, d)]
     now = float(zhvi.iloc[-1]) if len(zhvi) else None
     out = []
     for _, x in d.sort_values("sold_date").iterrows():
         then = _at(zhvi, x["sold_date"]) if now else None
         out.append({"sold_date": x["sold_date"].date().isoformat(), "address": x["address"],
-                    "price": float(x["price"]), "beds": x["beds"], "baths": x["baths"], "sqft": x["sqft"],
-                    "year_built": x["year_built"], "url": x["url"],
+                    "zip": x["zip"], "price": float(x["price"]), "beds": x["beds"], "baths": x["baths"],
+                    "sqft": x["sqft"], "year_built": x["year_built"], "url": x["url"],
                     "price_today": float(x["price"] * now / then) if then else None})
     return out
 
@@ -491,7 +583,7 @@ def filter_comps(subj: Subject, df: pd.DataFrame, c: Criteria) -> pd.DataFrame:
     df["months_ago"] = (TODAY - df["sold_date"]).dt.days / 30.44
     keep = (df["months_ago"] <= c.months) & (df["months_ago"] >= 0) & (df["price"] > 10_000)
     keep &= df["distance_mi"] <= c.radius
-    keep &= ~df["address"].fillna("").str.lower().eq(subj.address.split(",")[0].lower().strip())
+    keep &= ~is_subject(subj, df)
     if subj.ptype:
         keep &= df["property_type"].map(REDFIN_TYPE) == subj.ptype
     if subj.sqft:
@@ -527,20 +619,31 @@ def weighted_quantile(values, weights, q):
 
 
 def find_comps(subj: Subject, c: Criteria, uipt: str, monthly_growth: float) -> dict:
+    """Search comps, shrinking the radius at Redfin's row cap and widening it when too few match.
+
+    Never widens back past a radius that already hit the cap, and stops after a few searches.
+    """
     notes = []
-    sold_days = next(w for w in (30, 90, 180, 365, 730, 1095, 1825) if w >= c.months * 30.44 - 1)
-    radius = c.radius
-    while True:
+    sold_days = next(w for w in (30, 90, 180, 365, 730, 1095, 1825) if w >= c.months * 30)
+    radius, capped_at, tries = c.radius, None, 6
+    for i in range(tries):
         raw = redfin_csv(subj.lat, subj.lon, radius, sold_days=sold_days, uipt=uipt)
-        if len(raw) >= REDFIN_MAX_ROWS and radius > 0.15:
-            radius = round(radius * 0.6, 2)
-            notes.append(f"Search hit the {REDFIN_MAX_ROWS}-row cap; shrank radius to {radius} mi.")
-            continue
+        capped = len(raw) >= REDFIN_MAX_ROWS
+        if capped:
+            capped_at = radius if capped_at is None else min(capped_at, radius)
+            if radius > 0.15 and i < tries - 1:
+                radius = round(radius * 0.6, 2)
+                notes.append(f"Search hit the {REDFIN_MAX_ROWS}-row cap; shrank radius to {radius} mi.")
+                continue
+            notes.append(f"Search at {radius} mi still hit the {REDFIN_MAX_ROWS}-row cap; some sales are missing.")
         c.radius = radius
         pool = filter_comps(subj, raw, c)
-        if len(pool) >= c.min_comps or radius >= c.max_radius:
+        wider = min(c.max_radius, radius * 2)
+        if capped_at is not None:
+            wider = min(wider, round(capped_at * 0.9, 2))
+        if len(pool) >= c.min_comps or capped or wider <= radius or i == tries - 1:
             break
-        radius = min(c.max_radius, radius * 2)
+        radius = wider
         notes.append(f"Only {len(pool)} comps found; widened radius to {radius} mi.")
     if pool.empty:
         return {"radius_mi": radius, "candidates": len(raw), "comps": [], "notes": notes, "pool": pool}
@@ -554,6 +657,9 @@ def find_comps(subj: Subject, c: Criteria, uipt: str, monthly_growth: float) -> 
     if not subj.sqft and subj.beds is None:
         notes.append("No subject sqft/beds, so comps can't be size-matched; value estimate skipped. "
                      "Pass --sqft and --beds.")
+    elif not subj.verified:
+        notes.append("Subject specs weren't confirmed from a property record or flags; value estimate "
+                     "skipped. Pass --beds/--baths/--sqft/--type.")
     elif len(v):
         if not subj.sqft:
             notes.append("Subject sqft unknown: comps matched on beds only and not size-adjusted. Pass --sqft.")
@@ -596,8 +702,8 @@ def render(r: dict) -> str:
         if not z:
             continue
         L.append(f"\n## {r['years']}-year value trend — Zillow ZHVI, ZIP {s['zip']} ({label}, as of {z['as_of']})")
-        L.append(f"- Typical value **{money(z['value'])}**; 1-yr {pct(z['chg_1y'])}, 3-yr {pct(z['chg_3y'])}, "
-                 f"{yrs}-yr {pct(z.get(f'chg_{yrs}y'))} "
+        spans = ", ".join(f"{k}-yr {pct(z.get(f'chg_{k}y'))}" for k in sorted({1, 3, yrs}) if k <= yrs)
+        L.append(f"- Typical value **{money(z['value'])}**; {spans} "
                  f"(CAGR {pct(z['cagr'])}); last 3 mo annualized {pct(z['chg_3m_annualized'])}")
         L.append(f"- {r['years']}-yr peak {money(z['peak'])} ({z['peak_date']}), now {pct(z['vs_peak'])} vs peak; "
                  f"low {money(z['trough'])} ({z['trough_date']})")
@@ -685,36 +791,65 @@ def render(r: dict) -> str:
             L.append(f"Median ask {money(act['median_price'])}, {money(act['median_ppsf'])}/sqft, median DOM {num(act['median_dom'])}.")
     L.append("\n## Data notes")
     L += [f"- {n}" for n in r["notes"]]
+    L.append("\n_Sources: Zillow Research (ZHVI), Realtor.com Research (inventory), Redfin (sold and active "
+             "listings, MLS + public record), US Census geocoder. Automated estimate, not an appraisal._")
     return "\n".join(L) + "\n"
 
 
-def jsonable(o):
+def clean(o):
+    """Recursively convert to plain JSON types; NaN/NaT become None."""
     if isinstance(o, pd.DataFrame):
-        return json.loads(o.to_json(orient="records", date_format="iso"))
+        return clean(json.loads(o.to_json(orient="records", date_format="iso")))
+    if isinstance(o, dict):
+        return {k: clean(v) for k, v in o.items()}
+    if isinstance(o, (list, tuple)):
+        return [clean(v) for v in o]
+    if o is None or o is pd.NaT:
+        return None
     if isinstance(o, (pd.Timestamp, datetime)):
         return o.isoformat()
-    if isinstance(o, (np.integer,)):
+    if isinstance(o, (bool, np.bool_)):
+        return bool(o)
+    if isinstance(o, (int, np.integer)):
         return int(o)
-    if isinstance(o, (np.floating,)):
-        return None if np.isnan(o) else float(o)
-    raise TypeError(type(o))
+    if isinstance(o, (float, np.floating)):
+        return None if math.isnan(o) or math.isinf(o) else float(o)
+    return o
+
+
+def normalize_zip(z: str | None) -> str | None:
+    if not z:
+        return None
+    z = str(z).strip()[:5]
+    return z.zfill(5) if z.isdigit() else None
 
 
 def report(a) -> None:
     years = a.years
     notes: list[str] = []
+    global REDFIN_ENABLED
+    REDFIN_ENABLED = not a.no_redfin
     geo = geocode(a.address)
-    zip_code = a.zip or geo["zip"]
+    if a.zip and not normalize_zip(a.zip):
+        sys.exit(f"--zip must be a 5-digit ZIP code, got {a.zip!r}.")
+    zip_code = normalize_zip(a.zip) or normalize_zip(geo["zip"])
     if not zip_code:
         sys.exit("Could not determine ZIP; pass --zip.")
+    if a.zip and normalize_zip(geo["zip"]) not in (None, zip_code):
+        notes.append(f"--zip {zip_code} overrides the geocoded ZIP {geo['zip']} for market data only; "
+                     "Redfin searches still center on the geocoded location.")
     subj = Subject(address=a.address, lat=geo["lat"], lon=geo["lon"], zip=zip_code)
 
     redfin_ok = True
     try:
-        rec = find_subject_record(a.address, subj.lat, subj.lon)
+        rec, problem = find_subject_record(a.address, subj.lat, subj.lon)
     except RedfinBlocked as e:
-        rec, redfin_ok = None, False
-        notes.append(f"Redfin blocked the request ({e}). Comps/local sales unavailable — see SKILL.md fallbacks.")
+        rec, problem, redfin_ok = None, None, False
+        notes.append(f"Redfin unavailable ({e}). Comps and local sales skipped — see SKILL.md fallbacks.")
+    if rec is not None and rec["property_type"] not in REDFIN_TYPE and not a.type:
+        notes.append(f"Redfin's record for this address is '{rec['property_type']}', not a residential type "
+                     "this tool handles; its specs were not used. Pass --type and specs if it is a home.")
+        rec = None
     if rec is not None:
         subj.ptype = REDFIN_TYPE.get(rec["property_type"])
         for f in ("beds", "baths", "sqft", "year_built", "lot_sqft"):
@@ -724,17 +859,18 @@ def report(a) -> None:
             subj.last_sale_price = None if pd.isna(rec["price"]) else float(rec["price"])
             subj.last_sale_date = rec["sold_date"].date().isoformat()
         subj.url, subj.record_source = rec["url"], f"Redfin ({rec['address']})"
-        if rec["m"] < 1 or _tokens(rec["address"]) != _tokens(a.address.split(",")[0]):
-            notes.append(f"Subject matched Redfin record '{rec['address']}' (not an exact match); confirm "
-                         "it is the right property/unit or pass specs explicitly.")
-        if pd.isna(rec["sqft"]) and pd.isna(rec["beds"]):
+        subj.verified = pd.notna(rec["sqft"]) or pd.notna(rec["beds"])
+        if not subj.verified:
             notes.append("Redfin record has no beds/sqft (often a multi-unit building parcel); pass the unit "
-                         "in the address or --beds/--baths/--sqft/--type.")
+                         "in the address (e.g. '#3') or --beds/--baths/--sqft/--type.")
+    elif problem:
+        notes.append(f"Subject not matched: {problem}. Specs come from command-line flags only.")
     elif redfin_ok:
         notes.append("Subject not found in Redfin records; specs come from command-line flags only.")
     for f in ("beds", "baths", "sqft", "year_built"):
         if getattr(a, f) is not None:
             setattr(subj, f, float(getattr(a, f)))
+            subj.verified = True
     if a.type:
         subj.ptype = a.type
     if not subj.ptype:
@@ -743,19 +879,24 @@ def report(a) -> None:
     uipt, zseries, rtype = TYPES[subj.ptype]
 
     market = {}
-    zs_type, m = zillow_series(zip_code, zseries, a.refresh)
-    zs_all = zs_type
-    if zseries != "sfrcondo":
-        zs_all, _ = zillow_series(zip_code, "sfrcondo", a.refresh)
+    zs_type = zs_all = pd.Series(dtype=float)
+    zused, m = zseries, {}
+    try:
+        zs_type, m = zillow_series(zip_code, zseries, a.refresh)
+        zs_all = zs_type
+        if zseries != "sfrcondo":
+            zs_all, _ = zillow_series(zip_code, "sfrcondo", a.refresh)
+    except Exception as e:  # download/network trouble: keep the rest of the report
+        notes.append(f"Zillow data unavailable: {e}")
     if zs_type.empty and not zs_all.empty:
-        zs_type = zs_all
+        zs_type, zused = zs_all, "sfrcondo"
     if not zs_type.empty:
         market["zhvi_type"] = zhvi_summary(zs_type, years)
-        if zseries != "sfrcondo" and not zs_all.empty:
+        if zused != "sfrcondo" and not zs_all.empty:
             market["zhvi_all"] = zhvi_summary(zs_all, years)
-        notes.append(f"Zillow ZHVI ({zseries}) file last modified {m.get('last_modified')}; ZHVI is a smoothed, "
+        notes.append(f"Zillow ZHVI ({zused}) file last modified {m.get('last_modified')}; ZHVI is a smoothed, "
                      "seasonally adjusted typical value (35th–65th percentile homes), not a median sale price.")
-    else:
+    elif not any(n.startswith("Zillow data unavailable") for n in notes):
         notes.append(f"Zillow has no ZHVI series for ZIP {zip_code}.")
 
     try:
@@ -771,14 +912,16 @@ def report(a) -> None:
         tracker = redfin_tracker(zip_code, "All Residential")
     if not tracker.empty:
         market["redfin_tracker"] = redfin_tracker_summary(tracker)
-        notes.append("Redfin Data Center tracker comes from REDFIN_TRACKER_PARQUET; Redfin's public file "
-                     "has not been refreshed since early June 2026, so it lags.")
+        notes.append(f"Redfin Data Center tracker comes from REDFIN_TRACKER_PARQUET (period ending "
+                     f"{market['redfin_tracker']['as_of']}); it can lag the other sources by months.")
 
-    # Time adjustment: ZIP-level ZHVI growth over 12 months.
+    # Time adjustment for comps: ZIP-level ZHVI growth over the last 12 calendar months.
     g, gsrc = 0.0, "none"
-    if len(zs_type) >= 13:
-        g = (zs_type.iloc[-1] / zs_type.iloc[-13]) ** (1 / 12) - 1
-        gsrc = f"ZIP ZHVI ({zseries}) last 12 months"
+    if len(zs_type):
+        prior = _at(zs_type, zs_type.index[-1] - pd.DateOffset(years=1))
+        if prior:
+            g = (float(zs_type.iloc[-1]) / prior) ** (1 / 12) - 1
+            gsrc = f"ZIP ZHVI ({zused}) last 12 months"
 
     result = {"generated": TODAY.date().isoformat(), "years": years, "geocode": geo,
               "market": market, "notes": notes, "time_adj_annual": (1 + g) ** 12 - 1, "time_adj_source": gsrc}
@@ -801,8 +944,13 @@ def report(a) -> None:
                 pred = slope * x + icpt
                 r2 = 1 - ((y - pred) ** 2).sum() / max(((y - y.mean()) ** 2).sum(), 1e-12)
                 ls["trend"] = {"n": len(d), "annual_growth": float(np.expm1(slope)), "r2": float(r2)}
+            if years > MAX_YEARS_SALES:
+                notes.append(f"Local sales cover the last {MAX_YEARS_SALES} years only (Redfin's longest window).")
             result["local_sales"] = ls
             result["same_model"] = same_model_sales(subj, sales_hist, zs_type)
+            if result["same_model"]:
+                notes.append("Same-model 'Today' prices follow the actual ZHVI path since each sale; comp "
+                             "'Adj. price' uses the average 12-month rate, so the two can differ slightly.")
 
             cp = find_comps(subj, crit, uipt, g)
             notes += cp.pop("notes")
@@ -820,22 +968,36 @@ def report(a) -> None:
             notes.append("Redfin sold data is MLS-fed (typically days old) plus public records; some MLSs "
                          "exclude listings from the download, and non-disclosure states (e.g. TX, UT) may omit prices.")
         except RedfinBlocked as e:
-            notes.append(f"Redfin blocked the request mid-run ({e}).")
+            notes.append(f"Redfin unavailable mid-run ({e}); later Redfin sections are missing.")
     result["subject"] = asdict(subj)
 
     out = Path(a.out).expanduser() / f"{re.sub(r'[^a-z0-9]+', '-', a.address.lower()).strip('-')[:60]}-{TODAY:%Y%m%d}"
     out.mkdir(parents=True, exist_ok=True)
-    md = render(json.loads(json.dumps(result, default=jsonable)))
-    (out / "report.md").write_text(md)
-    (out / "data.json").write_text(json.dumps(result, default=jsonable, indent=1))
+    for f in ("local_sales.csv", "comps_all_matched.csv", "zhvi_monthly.csv"):
+        (out / f).unlink(missing_ok=True)  # don't leave files from an earlier run next to this report
+    data = clean(result)
+    md = render(data)
+    (out / "report.md").write_text(md, encoding="utf-8")
+    (out / "data.json").write_text(json.dumps(data, indent=1, allow_nan=False), encoding="utf-8")
     if not sales_hist.empty:
         sales_hist.to_csv(out / "local_sales.csv", index=False)
     if not comps_df.empty:
         comps_df.sort_values("similarity", ascending=False).to_csv(out / "comps_all_matched.csv", index=False)
-    series = pd.DataFrame({"zhvi_type": zs_type, "zhvi_all": zs_all})
-    series[series.index > TODAY - pd.DateOffset(years=years + 1)].rename_axis("date").to_csv(out / "zhvi_monthly.csv")
+    if not (zs_type.empty and zs_all.empty):
+        series = pd.DataFrame({"zhvi_type": zs_type, "zhvi_all": zs_all})
+        series[series.index > TODAY - pd.DateOffset(years=years + 1)].rename_axis("date").to_csv(out / "zhvi_monthly.csv")
+    sys.stdout.reconfigure(encoding="utf-8")
     print(md)
     print(f"\nFiles written to {out}", file=sys.stderr)
+
+
+def bounded_int(lo: int, hi: int):
+    def parse(v: str) -> int:
+        n = int(v)
+        if not lo <= n <= hi:
+            raise argparse.ArgumentTypeError(f"must be between {lo} and {hi}")
+        return n
+    return parse
 
 
 def main(argv=None):
@@ -848,9 +1010,10 @@ def main(argv=None):
     r.add_argument("--baths", type=float)
     r.add_argument("--sqft", type=float)
     r.add_argument("--year-built", dest="year_built", type=float)
-    r.add_argument("--zip", help="override ZIP if geocoding picks the wrong one")
-    r.add_argument("--years", type=int, default=5, help="trend lookback (default 5)")
-    r.add_argument("--months", type=int, default=6, help="comp sale window in months (default 6)")
+    r.add_argument("--zip", help="override the ZIP used for market data (Redfin searches still use the geocode)")
+    r.add_argument("--years", type=bounded_int(1, 20), default=5,
+                   help="trend lookback, 1-20 (default 5; local sales cap at 5)")
+    r.add_argument("--months", type=bounded_int(1, 60), default=6, help="comp sale window, 1-60 months (default 6)")
     r.add_argument("--radius", type=float, default=0.5, help="starting comp radius in miles (auto-widens)")
     r.add_argument("--trend-radius", dest="trend_radius", type=float, default=0.5,
                    help="radius for the local quarterly sales trend")
@@ -859,6 +1022,8 @@ def main(argv=None):
     r.add_argument("--max-comps", dest="max_comps", type=int, default=10)
     r.add_argument("--out", default="./property-reports")
     r.add_argument("--refresh", action="store_true", help="force re-download of market datasets")
+    r.add_argument("--no-redfin", dest="no_redfin", action="store_true",
+                   help="skip Redfin (subject record, comps, local sales, listings); Zillow/Realtor.com only")
     sub.add_parser("refresh", help="re-download Zillow and Realtor.com datasets")
     a = p.parse_args(argv)
     if a.cmd == "refresh":
