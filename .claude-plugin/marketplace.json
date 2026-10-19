@@ -1,0 +1,12 @@
+{
+  "name": "property-research",
+  "owner": { "name": "xiaofeihu" },
+  "plugins": [
+    {
+      "name": "property-research",
+      "displayName": "Property Research",
+      "source": "./plugins/property-research",
+      "description": "Address-level US real estate research: 5-year market trend, recent comps, same-model sales and active listings."
+    }
+  ]
+}

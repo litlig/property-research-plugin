@@ -1,0 +1,8 @@
+{
+  "name": "property-research",
+  "version": "0.1.0",
+  "description": "Research a US home from its address: 5-year ZIP market trend, recent comparable sales with a value range, same-model sales, and active listings, from free public data.",
+  "author": { "name": "xiaofeihu" },
+  "license": "MIT",
+  "keywords": ["real-estate", "comps", "housing-market", "valuation"]
+}
